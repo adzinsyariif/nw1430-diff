@@ -87,7 +87,10 @@ function editRuns(a, b) {
   const n = a.length - 1;
   const m = b.length - 1;
   const targetK = n - m;
-  let buf = new Int32Array(1 << 18);
+  // Furthest-x values fit in 16 bits while both texts stay under 65535
+  // lines (x + 1 <= 65535); wider texts fall back to a 32-bit buffer.
+  const BufArray = n <= 65534 && m <= 65534 ? Uint16Array : Int32Array;
+  let buf = new BufArray(1 << 18);
   const rowStarts = [0];
   // d = 0: the snake from the start on diagonal 0.
   let x = 0;
@@ -106,7 +109,7 @@ function editRuns(a, b) {
       if (need > buf.length) {
         let cap = buf.length * 2;
         while (cap < need) cap *= 2;
-        const next = new Int32Array(cap);
+        const next = new BufArray(cap);
         next.set(buf);
         buf = next;
       }
