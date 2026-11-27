@@ -36,22 +36,36 @@ function internLines(aLines, bLines) {
   const ids = new Map();
   const aIds = new Int32Array(aLines.length);
   const bIds = new Int32Array(bLines.length);
+  let lastLine = null;
+  let lastId = -1;
   for (let i = 0; i < aLines.length; i++) {
     const line = aLines[i];
+    if (line === lastLine) {
+      aIds[i] = lastId;
+      continue;
+    }
     let id = ids.get(line);
     if (id === undefined) {
       id = ids.size;
       ids.set(line, id);
     }
+    lastLine = line;
+    lastId = id;
     aIds[i] = id;
   }
   for (let i = 0; i < bLines.length; i++) {
     const line = bLines[i];
+    if (line === lastLine) {
+      bIds[i] = lastId;
+      continue;
+    }
     let id = ids.get(line);
     if (id === undefined) {
       id = ids.size;
       ids.set(line, id);
     }
+    lastLine = line;
+    lastId = id;
     bIds[i] = id;
   }
   return [aIds, bIds];
@@ -63,75 +77,124 @@ function internLines(aLines, bLines) {
  * furthest x reachable; deletion from diagonal k-1 and insertion from k+1
  * compete, the larger x wins and deletion wins a tie; moves past either
  * end are not candidates; from the winning point follow equal lines (the
- * snake) as far as they go. Every d's furthest-x array is kept so the
- * winning path can be walked back with the same tie-break.
+ * snake) as far as they go. Every d's furthest-x row is kept in one growing
+ * Int32Array (stored as x + 1, so 0 marks a dead diagonal) so the winning
+ * path can be walked back with the same tie-break. Both id arrays carry a
+ * distinct sentinel id in their last slot, so a snake stops at either end
+ * without bounds checks: a and b have length n + 1 and m + 1.
  */
 function editRuns(a, b) {
-  const n = a.length;
-  const m = b.length;
-  const history = [];
+  const n = a.length - 1;
+  const m = b.length - 1;
+  const targetK = n - m;
+  let buf = new Int32Array(1 << 18);
+  const rowStarts = [0];
   // d = 0: the snake from the start on diagonal 0.
   let x = 0;
-  while (x < n && x < m && a[x] === b[x]) x++;
-  history.push(Int32Array.of(x));
+  while (a[x] === b[x]) x++;
+  buf[0] = x + 1;
   let foundD = -1;
   if (x >= n && x >= m) {
     foundD = 0;
   } else {
     const maxD = n + m;
+    let prevStart = 0;
     outer: for (let d = 1; d <= maxD; d++) {
-      const prev = history[d - 1];
-      const cur = new Int32Array(d + 1).fill(-1);
-      for (let k = -d; k <= d; k += 2) {
-        const idx = (k + d) >> 1;
+      const curStart = prevStart + d;
+      rowStarts.push(curStart);
+      const need = curStart + d + 1;
+      if (need > buf.length) {
+        let cap = buf.length * 2;
+        while (cap < need) cap *= 2;
+        const next = new Int32Array(cap);
+        next.set(buf);
+        buf = next;
+      }
+      // Diagonal k = 2*idx - d; its deletion predecessor is prev[idx - 1],
+      // its insertion predecessor prev[idx]. The two edge diagonals have a
+      // single candidate each and are peeled out of the loop.
+      {
+        // idx = 0, k = -d: insertion from prev[0] only.
+        const s = buf[prevStart];
+        if (s > 0 && s - 1 + d - 1 < m) {
+          let cx = s - 1;
+          let cy = cx + d;
+          while (a[cx] === b[cy]) {
+            cx++;
+            cy++;
+          }
+          buf[curStart] = cx + 1;
+          if (-d === targetK && cx >= n) {
+            foundD = d;
+            break outer;
+          }
+        }
+      }
+      let k = -d + 2;
+      for (let idx = 1; idx < d; idx++, k += 2) {
+        const sd = buf[prevStart + idx - 1];
+        const si = buf[prevStart + idx];
         let delX = -1;
         let insX = -1;
-        if (k > -d) {
-          const xp = prev[(k + d - 2) >> 1];
-          if (xp >= 0 && xp < n) delX = xp + 1;
-        }
-        if (k < d) {
-          const xp = prev[(k + d) >> 1];
-          if (xp >= 0 && xp - (k + 1) < m) insX = xp;
-        }
+        if (sd > 0 && sd <= n) delX = sd;
+        if (si > 0 && si - k - 2 < m) insX = si - 1;
         if (delX < 0 && insX < 0) continue;
         let cx = delX >= insX ? delX : insX;
         let cy = cx - k;
-        while (cx < n && cy < m && a[cx] === b[cy]) {
+        while (a[cx] === b[cy]) {
           cx++;
           cy++;
         }
-        cur[idx] = cx;
-        if (cx >= n && cy >= m) {
-          history.push(cur);
+        buf[curStart + idx] = cx + 1;
+        if (k === targetK && cx >= n) {
           foundD = d;
           break outer;
         }
       }
-      history.push(cur);
+      {
+        // idx = d, k = d: deletion from prev[d - 1] only.
+        const s = buf[prevStart + d - 1];
+        if (s > 0 && s <= n) {
+          let cx = s;
+          let cy = cx - d;
+          while (a[cx] === b[cy]) {
+            cx++;
+            cy++;
+          }
+          buf[curStart + d] = cx + 1;
+          if (d === targetK && cx >= n) {
+            foundD = d;
+            break outer;
+          }
+        }
+      }
+      prevStart = curStart;
     }
   }
   if (foundD < 0) throw new Error('diff: the search ended without reaching both ends');
 
   // Walk the winning path back, re-deriving each step's winner from the
-  // stored furthest-x arrays with the same tie-break (deletion on a tie).
+  // stored furthest-x rows with the same tie-break (deletion on a tie).
   const revKinds = [];
   const revCounts = [];
   let bx = n;
-  let bk = n - m;
+  let bk = targetK;
   for (let d = foundD; d >= 1; d--) {
-    const prev = history[d - 1];
+    const prevStart = rowStarts[d - 1];
+    const idx = (bk + d) >> 1;
     let delX = -1;
     let insX = -1;
     let delPrev = -1;
     let insPrev = -1;
-    if (bk > -d) {
-      delPrev = prev[(bk + d - 2) >> 1];
-      if (delPrev >= 0 && delPrev < n) delX = delPrev + 1;
+    if (idx > 0) {
+      const s = buf[prevStart + idx - 1];
+      delPrev = s - 1;
+      if (s > 0 && delPrev < n) delX = s;
     }
-    if (bk < d) {
-      insPrev = prev[(bk + d) >> 1];
-      if (insPrev >= 0 && insPrev - (bk + 1) < m) insX = insPrev;
+    if (idx < d) {
+      const s = buf[prevStart + idx];
+      insPrev = s - 1;
+      if (s > 0 && insPrev - (bk + 1) < m) insX = insPrev;
     }
     if (delX >= insX) {
       const snake = bx - delX;
@@ -172,7 +235,7 @@ function editRuns(a, b) {
 
 /** One patch line: the op, the line itself, and "%" on its own line when the line had no newline. */
 function written(op, line) {
-  return line.endsWith('\n') ? op + line : op + line + '\n%\n';
+  return line.charCodeAt(line.length - 1) === 10 ? op + line : op + line + '\n%\n';
 }
 
 /** The makefun-diff/1 patch of input.old into input.new, as one string. */
@@ -195,7 +258,15 @@ export function run(input) {
 
   const runs = [];
   if (prefix > 0) runs.push([KEEP, prefix]);
-  const mid = editRuns(aIds.subarray(prefix, n - suffix), bIds.subarray(prefix, m - suffix));
+  // The middle id arrays, each closed by a distinct sentinel id (-1 / -2)
+  // so the search's snakes stop at either end on a mismatch.
+  const midA = new Int32Array(n - suffix - prefix + 1);
+  midA.set(aIds.subarray(prefix, n - suffix));
+  midA[midA.length - 1] = -1;
+  const midB = new Int32Array(m - suffix - prefix + 1);
+  midB.set(bIds.subarray(prefix, m - suffix));
+  midB[midB.length - 1] = -2;
+  const mid = editRuns(midA, midB);
   for (const r of mid) runs.push(r);
   if (suffix > 0) runs.push([KEEP, suffix]);
 
