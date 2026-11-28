@@ -72,6 +72,119 @@ function internLines(aLines, bLines) {
 }
 
 /**
+ * A lower bound on the LCS length of a[0..n) and b[0..m), built as an
+ * explicit common subsequence: ids occurring exactly once in both arrays
+ * give anchor pairs, the longest increasing chain of anchors (by b
+ * position, in a order) is kept, and inside each gap between anchors a
+ * next-occurrence greedy match adds more. Every match is increasing in
+ * both arrays, so the total never exceeds the true LCS length.
+ */
+function anchorCommon(a, b, n, m) {
+  // Line ids are dense non-negative ints below n + m, so counts and
+  // positions live in typed arrays indexed by id.
+  const cntA = new Int32Array(n + m);
+  for (let i = 0; i < n; i++) cntA[a[i]]++;
+  const cntB = new Int32Array(n + m);
+  const posB = new Int32Array(n + m);
+  for (let j = 0; j < m; j++) {
+    const id = b[j];
+    cntB[id]++;
+    posB[id] = j;
+  }
+  const seqPos = [];
+  const seqIdx = [];
+  for (let i = 0; i < n; i++) {
+    const id = a[i];
+    if (cntA[id] === 1 && cntB[id] === 1) {
+      seqPos.push(posB[id]);
+      seqIdx.push(i);
+    }
+  }
+  // Longest strictly increasing subsequence of seqPos, with the chain.
+  const piles = [];
+  const pileTop = [];
+  const prev = new Int32Array(seqPos.length).fill(-1);
+  for (let s = 0; s < seqPos.length; s++) {
+    const v = seqPos[s];
+    let lo = 0;
+    let hi = piles.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (piles[mid] < v) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo > 0) prev[s] = pileTop[lo - 1];
+    piles[lo] = v;
+    pileTop[lo] = s;
+  }
+  const chain = [];
+  if (pileTop.length > 0) {
+    let s = pileTop[pileTop.length - 1];
+    while (s !== -1) {
+      chain.push(s);
+      s = prev[s];
+    }
+    chain.reverse();
+  }
+  const anchors = [];
+  for (const s of chain) anchors.push(seqIdx[s], seqPos[s]);
+  let total = chain.length;
+  let aFrom = 0;
+  let bFrom = 0;
+  const matchGap = (aTo, bTo) => {
+    const aLen = aTo - aFrom;
+    const bLen = bTo - bFrom;
+    if (aLen <= 0 || bLen <= 0) return;
+    if (aLen * bLen <= 64) {
+      let at = bFrom - 1;
+      for (let i = aFrom; i < aTo; i++) {
+        for (let j = at + 1; j < bTo; j++) {
+          if (b[j] === a[i]) {
+            total++;
+            at = j;
+            break;
+          }
+        }
+      }
+      return;
+    }
+    const pos = new Map();
+    for (let j = bFrom; j < bTo; j++) {
+      const id = b[j];
+      let arr = pos.get(id);
+      if (arr === undefined) {
+        arr = [];
+        pos.set(id, arr);
+      }
+      arr.push(j);
+    }
+    let at = bFrom - 1;
+    for (let i = aFrom; i < aTo; i++) {
+      const arr = pos.get(a[i]);
+      if (arr === undefined) continue;
+      let lo = 0;
+      let hi = arr.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid] <= at) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo < arr.length) {
+        total++;
+        at = arr[lo];
+      }
+    }
+  };
+  for (let t = 0; t < anchors.length; t += 2) {
+    matchGap(anchors[t], anchors[t + 1]);
+    aFrom = anchors[t] + 1;
+    bFrom = anchors[t + 1] + 1;
+  }
+  matchGap(n, m);
+  return total;
+}
+
+/**
  * The edit runs of a into b (arrays of line ids): [[kind, count], ...] in order.
  * Myers's greedy search: for d edits and each diagonal k = x - y, keep the
  * furthest x reachable; deletion from diagonal k-1 and insertion from k+1
@@ -82,15 +195,28 @@ function internLines(aLines, bLines) {
  * path can be walked back with the same tie-break. Both id arrays carry a
  * distinct sentinel id in their last slot, so a snake stops at either end
  * without bounds checks: a and b have length n + 1 and m + 1.
+ *
+ * Diagonals far from the target diagonal are skipped: with Dmax an upper
+ * bound on the edit distance (from an anchor-chained common subsequence), the
+ * winning path at depth d always lies on a diagonal k with
+ * |k - targetK| <= Dmax - d, and its two predecessors at depth d - 1 lie
+ * in the same cone there, so every furthest-x value the winning path and
+ * the backtrack read is computed exactly as in the unpruned search.
+ * Skipped slots stay 0 (dead), which is all the backtrack would read for
+ * them anyway.
  */
 function editRuns(a, b) {
   const n = a.length - 1;
   const m = b.length - 1;
   const targetK = n - m;
+  const dMax = n + m < 2000 ? n + m : n + m - 2 * anchorCommon(a, b, n, m);
   // Furthest-x values fit in 16 bits while both texts stay under 65535
   // lines (x + 1 <= 65535); wider texts fall back to a 32-bit buffer.
   const BufArray = n <= 65534 && m <= 65534 ? Uint16Array : Int32Array;
-  let buf = new BufArray(1 << 18);
+  // Rows up to depth dMax need (dMax + 1)(dMax + 2) / 2 slots in all;
+  // preallocate that (capped) so the search rarely pays growth copies.
+  const want = Math.min(1 << 24, ((dMax + 2) * (dMax + 3)) / 2);
+  let buf = new BufArray(Math.max(1 << 18, want));
   const rowStarts = [0];
   // d = 0: the snake from the start on diagonal 0.
   let x = 0;
@@ -115,8 +241,13 @@ function editRuns(a, b) {
       }
       // Diagonal k = 2*idx - d; its deletion predecessor is prev[idx - 1],
       // its insertion predecessor prev[idx]. The two edge diagonals have a
-      // single candidate each and are peeled out of the loop.
-      {
+      // single candidate each and are peeled out of the loop. Only the
+      // cone |k - targetK| <= dMax - d is computed (see the header note).
+      const kLo = Math.max(-d, targetK - (dMax - d));
+      const kHi = Math.min(d, targetK + (dMax - d));
+      const idxLo = (kLo + d + 1) >> 1;
+      const idxHi = (kHi + d) >> 1;
+      if (idxLo === 0) {
         // idx = 0, k = -d: insertion from prev[0] only.
         const s = buf[prevStart];
         if (s > 0 && s - 1 + d - 1 < m) {
@@ -133,10 +264,14 @@ function editRuns(a, b) {
           }
         }
       }
-      let k = -d + 2;
-      for (let idx = 1; idx < d; idx++, k += 2) {
-        const sd = buf[prevStart + idx - 1];
-        const si = buf[prevStart + idx];
+      const startIdx = idxLo > 1 ? idxLo : 1;
+      const endIdx = idxHi < d - 1 ? idxHi : d - 1;
+      let k = 2 * startIdx - d;
+      let p = prevStart + startIdx;
+      let q = curStart + startIdx;
+      for (let idx = startIdx; idx <= endIdx; idx++, k += 2, p++, q++) {
+        const sd = buf[p - 1];
+        const si = buf[p];
         let delX = -1;
         let insX = -1;
         if (sd > 0 && sd <= n) delX = sd;
@@ -148,13 +283,13 @@ function editRuns(a, b) {
           cx++;
           cy++;
         }
-        buf[curStart + idx] = cx + 1;
+        buf[q] = cx + 1;
         if (k === targetK && cx >= n) {
           foundD = d;
           break outer;
         }
       }
-      {
+      if (idxHi === d) {
         // idx = d, k = d: deletion from prev[d - 1] only.
         const s = buf[prevStart + d - 1];
         if (s > 0 && s <= n) {
